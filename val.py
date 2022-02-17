@@ -9,7 +9,7 @@ from pycocotools.cocoeval import COCOeval
 import torch
 
 from datasets.coco import CocoValDataset
-from models.with_mobilenet import PoseEstimationWithMobileNet
+from models.with_mobilenetV3_sh import mobilenet_v3_small
 from modules.keypoints import extract_keypoints, group_keypoints
 from modules.load_state import load_state
 
@@ -112,11 +112,11 @@ def infer(net, img, scales, base_height, stride, pad_value=(0, 0, 0), img_mean=(
 
 def evaluate(labels, output_name, images_folder, net, multiscale=False, visualize=False):
     net = net.cuda().eval()
-    base_height = 368
+    base_height = 224
     scales = [1]
     if multiscale:
         scales = [0.5, 1.0, 1.5, 2.0]
-    stride = 8
+    stride = 16  # 8 -> 16
 
     dataset = CocoValDataset(labels, images_folder)
     coco_result = []
@@ -171,7 +171,7 @@ if __name__ == '__main__':
     parser.add_argument('--visualize', action='store_true', help='show keypoints')
     args = parser.parse_args()
 
-    net = PoseEstimationWithMobileNet()
+    net = mobilenet_v3_small()
     checkpoint = torch.load(args.checkpoint_path)
     load_state(net, checkpoint)
 

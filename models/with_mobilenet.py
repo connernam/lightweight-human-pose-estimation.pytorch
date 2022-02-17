@@ -29,6 +29,7 @@ class InitialStage(nn.Module):
             conv(num_channels, num_channels, bn=False),
             conv(num_channels, num_channels, bn=False)
         )
+        # padding 0 -> 1
         self.heatmaps = nn.Sequential(
             conv(num_channels, 512, kernel_size=1, padding=0, bn=False),
             conv(512, num_heatmaps, kernel_size=1, padding=0, bn=False, relu=False)
@@ -43,6 +44,7 @@ class InitialStage(nn.Module):
         heatmaps = self.heatmaps(trunk_features)
         pafs = self.pafs(trunk_features)
         return [heatmaps, pafs]
+        # return heatmaps, pafs
 
 
 class RefinementStageBlock(nn.Module):

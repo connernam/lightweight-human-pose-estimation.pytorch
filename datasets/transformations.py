@@ -210,7 +210,6 @@ class CropPad:
             for keypoint in other_annotation['keypoints']:
                 keypoint[0] += offset_left
                 keypoint[1] += offset_up
-
         return sample
 
     def _inside(self, point, width, height):

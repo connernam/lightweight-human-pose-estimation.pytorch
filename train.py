@@ -1,7 +1,7 @@
 import argparse
 import cv2
 import os
-
+import numpy as np
 import torch
 from torch.nn import DataParallel
 import torch.optim as optim
@@ -10,7 +10,7 @@ from torchvision import transforms
 
 from datasets.coco import CocoTrainDataset
 from datasets.transformations import ConvertKeypoints, Scale, Rotate, CropPad, Flip
-from modules.get_parameters import get_parameters_conv, get_parameters_bn, get_parameters_conv_depthwise
+from models.with_mobilenetV3_sh import mobilenet_v3_small
 from models.with_mobilenet import PoseEstimationWithMobileNet
 from modules.loss import l2_loss
 from modules.load_state import load_state, load_from_mobilenet
@@ -23,9 +23,10 @@ cv2.ocl.setUseOpenCL(False)  # To prevent freeze of DataLoader
 def train(prepared_train_labels, train_images_folder, num_refinement_stages, base_lr, batch_size, batches_per_iter,
           num_workers, checkpoint_path, weights_only, from_mobilenet, checkpoints_folder, log_after,
           val_labels, val_images_folder, val_output_name, checkpoint_after, val_after):
-    net = PoseEstimationWithMobileNet(num_refinement_stages)
+    net = mobilenet_v3_small()
+    # net = PoseEstimationWithMobileNet(num_refinement_stages)
 
-    stride = 8
+    stride = 16  # 8 -> 16
     sigma = 7
     path_thickness = 1
     dataset = CocoTrainDataset(prepared_train_labels, train_images_folder,
@@ -38,21 +39,7 @@ def train(prepared_train_labels, train_images_folder, num_refinement_stages, bas
                                    Flip()]))
     train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
 
-    optimizer = optim.Adam([
-        {'params': get_parameters_conv(net.model, 'weight')},
-        {'params': get_parameters_conv_depthwise(net.model, 'weight'), 'weight_decay': 0},
-        {'params': get_parameters_bn(net.model, 'weight'), 'weight_decay': 0},
-        {'params': get_parameters_bn(net.model, 'bias'), 'lr': base_lr * 2, 'weight_decay': 0},
-        {'params': get_parameters_conv(net.cpm, 'weight'), 'lr': base_lr},
-        {'params': get_parameters_conv(net.cpm, 'bias'), 'lr': base_lr * 2, 'weight_decay': 0},
-        {'params': get_parameters_conv_depthwise(net.cpm, 'weight'), 'weight_decay': 0},
-        {'params': get_parameters_conv(net.initial_stage, 'weight'), 'lr': base_lr},
-        {'params': get_parameters_conv(net.initial_stage, 'bias'), 'lr': base_lr * 2, 'weight_decay': 0},
-        {'params': get_parameters_conv(net.refinement_stages, 'weight'), 'lr': base_lr * 4},
-        {'params': get_parameters_conv(net.refinement_stages, 'bias'), 'lr': base_lr * 8, 'weight_decay': 0},
-        {'params': get_parameters_bn(net.refinement_stages, 'weight'), 'weight_decay': 0},
-        {'params': get_parameters_bn(net.refinement_stages, 'bias'), 'lr': base_lr * 2, 'weight_decay': 0},
-    ], lr=base_lr, weight_decay=5e-4)
+    optimizer = optim.AdamW(net.parameters())  # Adam -> AdamW
 
     num_iter = 0
     current_epoch = 0
@@ -74,8 +61,11 @@ def train(prepared_train_labels, train_images_folder, num_refinement_stages, bas
     net = DataParallel(net).cuda()
     net.train()
     for epochId in range(current_epoch, 280):
-        scheduler.step()
-        total_losses = [0, 0] * (num_refinement_stages + 1)  # heatmaps loss, paf loss per stage
+        print('Train Started... {}'.format(epochId))
+        optimizer.step()
+        total_losses = [0, 0] * (num_refinement_stages + 1)
+        # total_losses = [0, 0]  # [0, 0] * (num_refinement_stages + 1)
+
         batch_per_iter_idx = 0
         for batch_data in train_loader:
             if batch_per_iter_idx == 0:
@@ -87,7 +77,36 @@ def train(prepared_train_labels, train_images_folder, num_refinement_stages, bas
             keypoint_maps = batch_data['keypoint_maps'].cuda()
             paf_maps = batch_data['paf_maps'].cuda()
 
+            # tmp_img = images.squeeze().permute(1, 2, 0).detach().cpu().numpy()
+            # tmp_img = np.uint8(255 * tmp_img)
+            # tmp_img = cv2.resize(tmp_img, (500, 500))
+            #
+            # tmp_heat = keypoint_maps.squeeze().detach().cpu().numpy()
+            # tmp_heat = np.uint8(255 * tmp_heat)
+            #
+            # heat_img = cv2.applyColorMap(tmp_heat[-1], cv2.COLORMAP_JET)
+            # heat_img = cv2.resize(heat_img, (500, 500))
+            # final_img = cv2.addWeighted(heat_img, 0.7, tmp_img, 0.3, 0)
+            # cv2.imshow('r', final_img)
+            #
+            # key = cv2.waitKey()
+            # if key == 27:  # esc
+            #     return
+
             stages_output = net(images)
+            # tmp_img = images.squeeze().permute(1, 2, 0).detach().cpu().numpy()
+            # tmp_img = np.uint8(255 * tmp_img)
+            # tmp_img = cv2.resize(tmp_img, (500, 500))
+            #
+            # tmp_heat = stages_output[0].squeeze().detach().cpu().numpy()
+            # tmp_heat = np.uint8(255 * tmp_heat)
+            #
+            # heat_img = cv2.applyColorMap(tmp_heat[-1], cv2.COLORMAP_JET)
+            # heat_img = cv2.resize(heat_img, (500, 500))
+            # final_img = cv2.addWeighted(heat_img, 0.7, tmp_img, 0.3, 0)
+            # cv2.imshow('r', final_img)
+            #
+            # print(keypoint_maps.shape, ' : ', stages_output[0].shape)
 
             losses = []
             for loss_idx in range(len(total_losses) // 2):
@@ -103,7 +122,7 @@ def train(prepared_train_labels, train_images_folder, num_refinement_stages, bas
             loss.backward()
             batch_per_iter_idx += 1
             if batch_per_iter_idx == batches_per_iter:
-                optimizer.step()
+                scheduler.step()
                 batch_per_iter_idx = 0
                 num_iter += 1
             else:
@@ -141,8 +160,8 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=80, help='batch size')
     parser.add_argument('--batches-per-iter', type=int, default=1, help='number of batches to accumulate gradient from')
     parser.add_argument('--num-workers', type=int, default=8, help='number of workers')
-    parser.add_argument('--checkpoint-path', type=str, required=True, help='path to the checkpoint to continue training from')
-    parser.add_argument('--from-mobilenet', action='store_true',
+    parser.add_argument('--checkpoint-path', '-c', type=str, required=True, help='path to the checkpoint to continue training from')
+    parser.add_argument('--from-mobilenet', '-m', action='store_true',
                         help='load weights from mobilenet feature extractor')
     parser.add_argument('--weights-only', action='store_true',
                         help='just initialize layers with pre-trained weights and start training from the beginning')

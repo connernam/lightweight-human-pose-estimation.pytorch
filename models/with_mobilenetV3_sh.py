@@ -1,6 +1,6 @@
-import torch
-
 from functools import partial
+
+import torch
 from torch import nn, Tensor
 from torch.nn import functional as F
 from typing import Any, Callable, Dict, List, Optional, Sequence
@@ -11,12 +11,94 @@ from torchvision.models.mobilenetv2 import _make_divisible, ConvBNActivation
 
 __all__ = ["MobileNetV3", "mobilenet_v3_large", "mobilenet_v3_small"]
 
-from models.with_mobilenet import Cpm, InitialStage
+from modules.conv import conv, conv_dw_no_bn
 
 model_urls = {
     "mobilenet_v3_large": "https://download.pytorch.org/models/mobilenet_v3_large-8738ca79.pth",
     "mobilenet_v3_small": "https://download.pytorch.org/models/mobilenet_v3_small-047dcff4.pth",
 }
+
+
+class Cpm(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.align = conv(in_channels, out_channels, kernel_size=1, padding=0, bn=False)
+        self.trunk = nn.Sequential(
+            conv_dw_no_bn(out_channels, out_channels),
+            conv_dw_no_bn(out_channels, out_channels),
+            conv_dw_no_bn(out_channels, out_channels)
+        )
+        self.conv = conv(out_channels, out_channels, bn=False)
+
+    def forward(self, x):
+        x = self.align(x)
+        x = self.conv(x + self.trunk(x))
+        return x
+
+
+class InitialStage(nn.Module):
+    def __init__(self, num_channels, num_heatmaps, num_pafs):
+        super().__init__()
+        self.trunk = nn.Sequential(
+            conv(num_channels, num_channels, bn=False),
+            conv(num_channels, num_channels, bn=False),
+            conv(num_channels, num_channels, bn=False)
+        )
+        self.heatmaps = nn.Sequential(
+            conv(num_channels, 576, kernel_size=1, padding=0, bn=False),
+            conv(576, num_heatmaps, kernel_size=1, padding=0, bn=False, relu=False)
+        )
+        self.pafs = nn.Sequential(
+            conv(num_channels, 576, kernel_size=1, padding=0, bn=False),
+            conv(576, num_pafs, kernel_size=1, padding=0, bn=False, relu=False)
+        )
+
+    def forward(self, x):
+        trunk_features = self.trunk(x)
+        heatmaps = self.heatmaps(trunk_features)
+        pafs = self.pafs(trunk_features)
+        return [heatmaps, pafs]
+
+
+class RefinementStageBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.initial = conv(in_channels, out_channels, kernel_size=1, padding=0, bn=False)
+        self.trunk = nn.Sequential(
+            conv(out_channels, out_channels),
+            conv(out_channels, out_channels, dilation=2, padding=2)
+        )
+
+    def forward(self, x):
+        initial_features = self.initial(x)
+        trunk_features = self.trunk(initial_features)
+        return initial_features + trunk_features
+
+
+class RefinementStage(nn.Module):
+    def __init__(self, in_channels, out_channels, num_heatmaps, num_pafs):
+        super().__init__()
+        self.trunk = nn.Sequential(
+            RefinementStageBlock(in_channels, out_channels),
+            RefinementStageBlock(out_channels, out_channels),
+            RefinementStageBlock(out_channels, out_channels),
+            RefinementStageBlock(out_channels, out_channels),
+            RefinementStageBlock(out_channels, out_channels)
+        )
+        self.heatmaps = nn.Sequential(
+            conv(out_channels, out_channels, kernel_size=1, padding=0, bn=False),
+            conv(out_channels, num_heatmaps, kernel_size=1, padding=0, bn=False, relu=False)
+        )
+        self.pafs = nn.Sequential(
+            conv(out_channels, out_channels, kernel_size=1, padding=0, bn=False),
+            conv(out_channels, num_pafs, kernel_size=1, padding=0, bn=False, relu=False)
+        )
+
+    def forward(self, x):
+        trunk_features = self.trunk(x)
+        heatmaps = self.heatmaps(trunk_features)
+        pafs = self.pafs(trunk_features)
+        return [heatmaps, pafs]
 
 
 class SqueezeExcitation(nn.Module):
@@ -157,8 +239,13 @@ class MobileNetV3(nn.Module):
         num_pafs = 38
 
         self.features = nn.Sequential(*layers)
-        self.cpm = Cpm(576, num_channels)  # 512 -> 288
+        self.cpm = Cpm(288, num_channels)  # 512 -> 576
         self.initial_stage = InitialStage(num_channels, num_heatmaps, num_pafs)
+        self.refinement_stages = nn.ModuleList()
+        for idx in range(num_refinement_stages):
+            self.refinement_stages.append(RefinementStage(num_channels + num_heatmaps + num_pafs, num_channels,
+                                                          num_heatmaps, num_pafs))
+
         # self.avgpool = nn.AdaptiveAvgPool2d(1)
         # self.classifier = nn.Sequential(
         #     nn.Linear(lastconv_output_channels, last_channel),
@@ -183,6 +270,10 @@ class MobileNetV3(nn.Module):
         backbone_features = self.features(x)
         backbone_features = self.cpm(backbone_features)
         stages_output = [*self.initial_stage(backbone_features)]
+        for refinement_stage in self.refinement_stages:
+            stages_output.extend(
+                refinement_stage(torch.cat([backbone_features, stages_output[-2], stages_output[-1]], dim=1)))
+
         # x = self.avgpool(x)
         # x = torch.flatten(x, 1)
 
@@ -231,9 +322,9 @@ def _mobilenet_v3_conf(arch: str, width_mult: float = 1.0, reduced_tail: bool = 
             bneck_conf(40, 5, 240, 40, True, "HS", 1, 1),
             bneck_conf(40, 5, 120, 48, True, "HS", 1, 1),
             bneck_conf(48, 5, 144, 48, True, "HS", 1, 1),
-            bneck_conf(48, 5, 288, 96 // reduce_divider, True, "HS", 2, dilation),  # C4
-            bneck_conf(96 // reduce_divider, 5, 576 // reduce_divider, 96 // reduce_divider, True, "HS", 1, dilation),
-            bneck_conf(96 // reduce_divider, 5, 576 // reduce_divider, 96 // reduce_divider, True, "HS", 1, dilation),
+            # bneck_conf(48, 5, 288, 96 // reduce_divider, True, "HS", 2, dilation),  # C4
+            # bneck_conf(96 // reduce_divider, 5, 576 // reduce_divider, 96 // reduce_divider, True, "HS", 1, dilation),
+            # bneck_conf(96 // reduce_divider, 5, 576 // reduce_divider, 96 // reduce_divider, True, "HS", 1, dilation),
         ]
         last_channel = adjust_channels(1024 // reduce_divider)  # C5
     else:
@@ -271,7 +362,6 @@ def mobilenet_v3_large(pretrained: bool = False, progress: bool = True, **kwargs
     arch = "mobilenet_v3_large"
     inverted_residual_setting, last_channel = _mobilenet_v3_conf(arch, **kwargs)
     return _mobilenet_v3_model(arch, inverted_residual_setting, last_channel, pretrained, progress, **kwargs)
-
 
 
 def mobilenet_v3_small(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> MobileNetV3:
